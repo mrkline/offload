@@ -92,6 +92,13 @@ mod test {
 
     #[test]
     fn smoke() {
+        let w = Worker::new();
+        let future = w.send(|| 42 + 27);
+        assert_eq!(69, future.wait().unwrap());
+    }
+
+    #[test]
+    fn sequential() {
         let data = [
             "Every gun that is made",
             "every warship launched",
