@@ -2,26 +2,24 @@
 //! (e.g., to serialize them without breaking out `async` machinery)
 //! and await their results.
 
-use std::{
-    sync::mpsc::{channel, sync_channel, Receiver, RecvError, Sender},
-    thread::{self, spawn, JoinHandle},
-};
+use std::sync::mpsc::{channel, sync_channel, Receiver, RecvError, Sender, TryRecvError};
 
-/// A worker thread to send arbitray tasks to, so long as they're [`Send`]
+/// Arbitrary work we can enqueue in a channel and then call in another thread
+/// on the receiving end.
+pub type PackagedTask = Box<dyn FnOnce() + Send>;
+
+/// Packages jobs into something that can be awaited with a [`Future`]
 #[derive(Debug)]
-pub struct Worker {
-    /// Handle for the worker thread
-    t: JoinHandle<()>,
-
+pub struct TaskSender {
     /// Tasks to do.
     ///
     /// By the time they get here, they're type-erased into any closure
     /// we can send.
-    todos: Sender<Box<dyn FnOnce() + Send>>,
+    todos: Sender<PackagedTask>,
 }
 
 /// Something that can be waited on in order to produce a result
-/// computed by a [`Worker`] job
+/// computed by calls to [`tick()`]
 #[derive(Debug)]
 pub struct Future<T> {
     // This could maybe be something simpler, but IIRC
@@ -31,27 +29,16 @@ pub struct Future<T> {
 }
 
 impl<T> Future<T> {
-    /// Returns the result, or a [`RecvError`] if this outlived the [`Worker`]
+    /// Returns the result, or a [`RecvError`] if this outlived the [`TaskSender`]
     pub fn wait(self) -> Result<T, RecvError> {
         self.rx.recv()
     }
 }
 
-impl Worker {
-    pub fn new() -> Self {
-        let (todos, rx) = channel::<Box<dyn FnOnce() + Send>>();
-        let worker = spawn(move ||
-            // Just drain the queue
-            while let Ok(work) = rx.recv(){
-                work();
-            }
-        );
-        Self { t: worker, todos }
-    }
-
-    /// Join the worker thread. (The default [`Drop`] detaches it.)
-    pub fn join(self) -> thread::Result<()> {
-        self.t.join()
+impl TaskSender {
+    pub fn new() -> (Self, Receiver<PackagedTask>) {
+        let (todos, rx) = channel::<PackagedTask>();
+        (Self { todos }, rx)
     }
 
     /// Push work onto the worker thread,
@@ -64,13 +51,9 @@ impl Worker {
         let (tx, rx) = sync_channel(1);
         // Type erasure! Put our closure in a closure that sends the result.
         let erased = move || {
-            match tx.send(fun()) {
-                Ok(()) => { /* The future gets its result */ }
-                Err(_e) => {
-                    // If the future got closed,
-                    // there's nothing we can do from here.
-                }
-            }
+            // We don't care if the future gets its result;
+            // if send() fails there's nothing we can do from here.
+            let _ = tx.send(fun());
         };
         // We should always be able to send to the worker unless it crashed
         self.todos
@@ -78,12 +61,27 @@ impl Worker {
             .expect("Worker thread hung up");
         Future { rx }
     }
+
+    /// Push work onto the worker thread and immediately wait for it to finish.
+    ///
+    /// Useful for other threads to serialize work on a worker calling [`tick()`]
+    pub fn run<T, F>(&self, fun: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        // We shouldn't get an error here since `wait()`
+        // only fails if the future outlives the worker,
+        // and here we are in the worker.
+        self.send(fun).wait().unwrap()
+    }
 }
 
-impl Default for Worker {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Run a single packaged task, presumably on a worker thread.
+///
+/// Return an error if the [`TaskSender`] hung up or there's nothing to do.
+pub fn tick(rx: &Receiver<PackagedTask>) -> Result<(), TryRecvError> {
+    rx.try_recv().map(|job| job())
 }
 
 #[cfg(test)]
@@ -92,9 +90,12 @@ mod test {
 
     #[test]
     fn smoke() {
-        let w = Worker::new();
-        let future = w.send(|| 42 + 27);
-        assert_eq!(69, future.wait().unwrap());
+        let (tx, rx) = TaskSender::new();
+        let future = tx.send(|| 42 + 27);
+        drop(tx);
+
+        tick(&rx).unwrap();
+        assert_eq!(69, future.wait().unwrap())
     }
 
     #[test]
@@ -110,15 +111,21 @@ mod test {
         ];
         let mut futures = vec![];
 
-        let w = Worker::new();
+        let (tx, rx) = TaskSender::new();
         for d in &data {
             let d = *d;
             // Some dumb function that returns the given value
             let jorb = move || d;
-            futures.push(w.send(jorb));
+            futures.push(tx.send(jorb));
         }
+        drop(tx);
+
+        // Run tick() in a worker thread.
+        // (This could just be a loop, but to demonstrate multi-thread love...)
+        let t = std::thread::spawn(move || while tick(&rx).is_ok() {});
 
         let results: Vec<_> = futures.into_iter().map(|f| f.wait().unwrap()).collect();
+        t.join().unwrap();
 
         assert_eq!(results, data);
     }
