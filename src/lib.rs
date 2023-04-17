@@ -80,7 +80,14 @@ impl TaskSender {
 /// Run a single packaged task, presumably on a worker thread.
 ///
 /// Return an error if the [`TaskSender`] hung up or there's nothing to do.
-pub fn tick(rx: &Receiver<PackagedTask>) -> Result<(), TryRecvError> {
+pub fn tick(rx: &Receiver<PackagedTask>) -> Result<(), RecvError> {
+    rx.recv().map(|job| job())
+}
+
+/// Run a single packaged task if one is ready, presumably on a worker thread.
+///
+/// Return an error if the [`TaskSender`] hung up or there's nothing to do.
+pub fn try_tick(rx: &Receiver<PackagedTask>) -> Result<(), TryRecvError> {
     rx.try_recv().map(|job| job())
 }
 
@@ -109,22 +116,21 @@ mod test {
             "those who are cold and are not clothed.",
             "This world in arms is not spending money alone.",
         ];
-        let mut futures = vec![];
 
         let (tx, rx) = TaskSender::new();
+
+        // Run tick() in a worker thread.
+        let t = std::thread::spawn(move || while tick(&rx).is_ok() {});
+
+        let mut results = vec![];
         for d in &data {
             let d = *d;
             // Some dumb function that returns the given value
             let jorb = move || d;
-            futures.push(tx.send(jorb));
+            results.push(tx.run(jorb));
         }
         drop(tx);
 
-        // Run tick() in a worker thread.
-        // (This could just be a loop, but to demonstrate multi-thread love...)
-        let t = std::thread::spawn(move || while tick(&rx).is_ok() {});
-
-        let results: Vec<_> = futures.into_iter().map(|f| f.wait().unwrap()).collect();
         t.join().unwrap();
 
         assert_eq!(results, data);
