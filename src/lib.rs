@@ -6,16 +6,16 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, RecvError, Sender, TryRec
 
 /// Arbitrary work we can enqueue in a channel and then call in another thread
 /// on the receiving end.
-pub type PackagedTask = Box<dyn FnOnce() + Send>;
+pub type PackagedTask<Context> = Box<dyn FnOnce(&Context) + Send>;
 
 /// Packages jobs into something that can be awaited with a [`Future`]
 #[derive(Debug)]
-pub struct TaskSender {
+pub struct TaskSender<Context> {
     /// Tasks to do.
     ///
     /// By the time they get here, they're type-erased into any closure
     /// we can send.
-    todos: Sender<PackagedTask>,
+    todos: Sender<PackagedTask<Context>>,
 }
 
 /// Something that can be waited on in order to produce a result
@@ -35,9 +35,9 @@ impl<T> Future<T> {
     }
 }
 
-impl TaskSender {
-    pub fn new() -> (Self, Receiver<PackagedTask>) {
-        let (todos, rx) = channel::<PackagedTask>();
+impl<Context> TaskSender<Context> {
+    pub fn new() -> (Self, Receiver<PackagedTask<Context>>) {
+        let (todos, rx) = channel::<PackagedTask<Context>>();
         (Self { todos }, rx)
     }
 
@@ -46,14 +46,14 @@ impl TaskSender {
     pub fn send<T, F>(&self, fun: F) -> Future<T>
     where
         T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
+        F: FnOnce(&Context) -> T + Send + 'static,
     {
         let (tx, rx) = sync_channel(1);
         // Type erasure! Put our closure in a closure that sends the result.
-        let erased = move || {
+        let erased = move |c: &Context| {
             // We don't care if the future gets its result;
             // if send() fails there's nothing we can do from here.
-            let _ = tx.send(fun());
+            let _ = tx.send(fun(c));
         };
         // We should always be able to send to the worker unless it crashed
         self.todos
@@ -68,7 +68,7 @@ impl TaskSender {
     pub fn run<T, F>(&self, fun: F) -> T
     where
         T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
+        F: FnOnce(&Context) -> T + Send + 'static,
     {
         // We shouldn't get an error here since `wait()`
         // only fails if the future outlives the worker,
@@ -80,59 +80,68 @@ impl TaskSender {
 /// Run a single packaged task, presumably on a worker thread.
 ///
 /// Return an error if the [`TaskSender`] hung up or there's nothing to do.
-pub fn tick(rx: &Receiver<PackagedTask>) -> Result<(), RecvError> {
-    rx.recv().map(|job| job())
+pub fn tick<Context>(rx: &Receiver<PackagedTask<Context>>, c: &Context) -> Result<(), RecvError> {
+    rx.recv().map(|job| job(c))
 }
 
 /// Run a single packaged task if one is ready, presumably on a worker thread.
 ///
 /// Return an error if the [`TaskSender`] hung up or there's nothing to do.
-pub fn try_tick(rx: &Receiver<PackagedTask>) -> Result<(), TryRecvError> {
-    rx.try_recv().map(|job| job())
+pub fn try_tick<Context>(
+    rx: &Receiver<PackagedTask<Context>>,
+    c: &Context,
+) -> Result<(), TryRecvError> {
+    rx.try_recv().map(|job| job(c))
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::rc::Rc;
 
     #[test]
     fn smoke() {
+        // Pretend I'm some big nasty not-Send thing
+        // (demoing with Rc since it's not Send or Sync)
+        type Context = Rc<i32>;
+
+        let c: Context = Rc::new(27);
+
         let (tx, rx) = TaskSender::new();
-        let future = tx.send(|| 42 + 27);
+        let future = tx.send(|c: &Context| 42 + **c);
         drop(tx);
 
-        tick(&rx).unwrap();
+        tick(&rx, &c).unwrap();
         assert_eq!(69, future.wait().unwrap())
     }
 
     #[test]
     fn sequential() {
-        let data = [
-            "Every gun that is made",
-            "every warship launched",
-            "every rocket fired signifies",
-            "in the final sense",
-            "a theft from those who hunger and are not fed",
-            "those who are cold and are not clothed.",
-            "This world in arms is not spending money alone.",
-        ];
+        let data = [25, 6, 2, 4];
+
+        // Pretend I'm some big nasty not-Send thing
+        // (demoing with Rc since it's not Send or Sync)
+        type Context = Rc<i32>;
 
         let (tx, rx) = TaskSender::new();
 
         // Run tick() in a worker thread.
-        let t = std::thread::spawn(move || while tick(&rx).is_ok() {});
+        let t = std::thread::spawn(move || {
+            let c: Context = Rc::new(42);
+            while tick(&rx, &c).is_ok() {}
+        });
 
         let mut results = vec![];
         for d in &data {
             let d = *d;
             // Some dumb function that returns the given value
-            let jorb = move || d;
+            let jorb = move |c: &Context| d + **c;
             results.push(tx.run(jorb));
         }
         drop(tx);
 
         t.join().unwrap();
 
-        assert_eq!(results, data);
+        assert_eq!(results, data.map(|i| i + 42));
     }
 }
